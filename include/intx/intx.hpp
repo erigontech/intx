@@ -2024,6 +2024,38 @@ namespace div32
 {
 using u32 = uint32_t;
 using u64 = uint64_t;
+/// A 32-bit word of a uint<N> (stored as 64-bit words): may alias them.
+typedef uint32_t __attribute__((may_alias)) w32;
+
+/// Leading zeros of a non-zero word in 5 compare-and-shift steps: libgcc's __clzsi2 is a call,
+/// around which the caller spills its live registers.
+constexpr unsigned clz_nonzero(u32 x) noexcept
+{
+    unsigned n = 0;
+    if (x < 0x10000)
+    {
+        n += 16;
+        x <<= 16;
+    }
+    if (x < 0x1000000)
+    {
+        n += 8;
+        x <<= 8;
+    }
+    if (x < 0x10000000)
+    {
+        n += 4;
+        x <<= 4;
+    }
+    if (x < 0x40000000)
+    {
+        n += 2;
+        x <<= 2;
+    }
+    if (x < 0x80000000)
+        n += 1;
+    return n;
+}
 
 /// floor((B^2 - 1) / d) - B for normalized d: the 64/32 division (~d : B-1) / d, whose quotient
 /// fits a word as ~d < d. Hacker's Delight divlu: two 32/16-digit steps on divu.
@@ -2163,7 +2195,7 @@ constexpr u32 add(u32* x, const u32* y, size_t n) noexcept
 
 /// Knuth's D over the normalized u[0..ulen) by d[0..dlen), dlen >= 3: q[0..ulen-dlen) gets the
 /// quotient digits, u[0..dlen) the normalized remainder.
-constexpr void udivrem_knuth(u32* q, u32* u, size_t ulen, const u32* d, size_t dlen) noexcept
+constexpr void udivrem_knuth(w32* q, u32* u, size_t ulen, const u32* d, size_t dlen) noexcept
 {
     const auto d1 = d[dlen - 1];
     const auto d0 = d[dlen - 2];
@@ -2205,15 +2237,24 @@ constexpr void udivrem_knuth(u32* q, u32* u, size_t ulen, const u32* d, size_t d
     }
 }
 
+template <typename T>
+[[gnu::always_inline]] inline T uninit_uint() noexcept
+{
+    if constexpr (requires { typename T::uninit_tag; })
+        return T{typename T::uninit_tag{}};
+    else
+        return T{};
+}
+
 template <unsigned M, unsigned N>
 constexpr div_result<uint<M>, uint<N>> udivrem(const uint<M>& x, const uint<N>& y) noexcept
 {
     constexpr size_t UW = M / 32;
     constexpr size_t VW = N / 32;
-    u32 uw[UW];
-    u32 vw[VW];
-    std::memcpy(uw, &x, sizeof(uw));
-    std::memcpy(vw, &y, sizeof(vw));
+    // Spelled out: `auto` would deduce plain uint32_t, dropping may_alias, and then GCC is free to
+    // drop the result stores as dead stores to uint64_t words.
+    const w32* const uw = reinterpret_cast<const w32*>(&x);
+    const w32* const vw = reinterpret_cast<const w32*>(&y);
 
     size_t n = VW;
     while (n > 0 && vw[n - 1] == 0)
@@ -2226,8 +2267,9 @@ constexpr div_result<uint<M>, uint<N>> udivrem(const uint<M>& x, const uint<N>& 
         return {0, static_cast<uint<N>>(x)};
 
     // Normalize: shift both left until the divisor's top word has its top bit set.
-    const auto shift = static_cast<unsigned>(std::countl_zero(vw[n - 1]));
-    u32 un[UW + 1]{};
+    // Only un[0..m] and dn[0..n) are used.
+    const auto shift = clz_nonzero(vw[n - 1]);
+    u32 un[UW + 1];
     u32 dn[VW];
     if (shift != 0)
     {
@@ -2245,14 +2287,21 @@ constexpr div_result<uint<M>, uint<N>> udivrem(const uint<M>& x, const uint<N>& 
             dn[i] = vw[i];
         for (size_t i = 0; i < m; ++i)
             un[i] = uw[i];
+        un[m] = 0;
     }
     // Count the normalized numerator's top word if significant.
     const size_t ulen = (un[m] != 0 || un[m - 1] >= dn[n - 1]) ? m + 1 : m;
     if (ulen <= n)
         return {0, static_cast<uint<N>>(x)};
 
-    u32 qw[UW]{};
-    u32 rw[VW]{};
+    // Write the quotient digits [0, ulen - n) and the remainder straight into the result.
+    div_result<uint<M>, uint<N>> res{uninit_uint<uint<M>>(), uninit_uint<uint<N>>()};
+    w32* const qw = reinterpret_cast<w32*>(&res.quot);
+    w32* const rw = reinterpret_cast<w32*>(&res.rem);
+    for (size_t i = ulen - n; i < UW; ++i)
+        qw[i] = 0;
+    for (size_t i = n; i < VW; ++i)
+        rw[i] = 0;
     if (n == 1)
     {
         const auto d = dn[0];
@@ -2288,10 +2337,6 @@ constexpr div_result<uint<M>, uint<N>> udivrem(const uint<M>& x, const uint<N>& 
                 rw[i] = un[i];
         }
     }
-
-    div_result<uint<M>, uint<N>> res;
-    std::memcpy(&res.quot, qw, sizeof(qw));
-    std::memcpy(&res.rem, rw, sizeof(rw));
     return res;
 }
 }  // namespace div32
