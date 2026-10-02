@@ -2016,11 +2016,296 @@ constexpr void udivrem_knuth(
     }
 }
 
+#if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || defined(INTX_DIV32_TEST)
+/// Division on 32-bit words for rv32, where a 64-bit word multiplication is 4 multiplications and
+/// a dozen carry instructions but the 32 x 32 -> 64 one is mul + mulhu and divu is native:
+/// the algorithms above (Moller-Granlund reciprocals, Knuth's D) with B = 2^32.
+namespace div32
+{
+using u32 = uint32_t;
+using u64 = uint64_t;
+
+/// floor((B^2 - 1) / d) - B for normalized d: the 64/32 division (~d : B-1) / d, whose quotient
+/// fits a word as ~d < d. Hacker's Delight divlu: two 32/16-digit steps on divu.
+constexpr u32 reciprocal_2by1(u32 d) noexcept
+{
+    const u32 u1 = ~d;
+    const u32 dh = d >> 16;
+    const u32 dl = d & 0xffff;
+    u32 q1 = u1 / dh;
+    u32 rhat = u1 - q1 * dh;
+    while (q1 >= 0x10000 || q1 * dl > ((rhat << 16) | 0xffff))
+    {
+        --q1;
+        rhat += dh;
+        if (rhat >= 0x10000)
+            break;
+    }
+    const u32 u21 = (u1 << 16) + 0xffff - q1 * d;
+    u32 q0 = u21 / dh;
+    rhat = u21 - q0 * dh;
+    while (q0 >= 0x10000 || q0 * dl > ((rhat << 16) | 0xffff))
+    {
+        --q0;
+        rhat += dh;
+        if (rhat >= 0x10000)
+            break;
+    }
+    return (q1 << 16) | q0;
+}
+
+constexpr u32 reciprocal_3by2(u32 d1, u32 d0) noexcept
+{
+    auto v = reciprocal_2by1(d1);
+    auto p = d1 * v;
+    p += d0;
+    if (p < d0)
+    {
+        --v;
+        if (p >= d1)
+        {
+            --v;
+            p -= d1;
+        }
+        p -= d1;
+    }
+    const auto t = u64{v} * d0;
+    const auto t1 = static_cast<u32>(t >> 32);
+    p += t1;
+    if (p < t1)
+    {
+        --v;
+        if (p >= d1)
+        {
+            if (p > d1 || static_cast<u32>(t) >= d0)
+                --v;
+        }
+    }
+    return v;
+}
+
+/// (u1 : u0) / d for u1 < d and v = reciprocal_2by1(d): returns the quotient, rem = remainder.
+constexpr u32 udivrem_2by1(u32 u1, u32 u0, u32 d, u32 v, u32& rem) noexcept
+{
+    const u64 q = u64{v} * u1 + (u64{u1} << 32 | u0);
+    auto q1 = static_cast<u32>(q >> 32) + 1;
+    const auto q0 = static_cast<u32>(q);
+    auto r = u0 - q1 * d;
+    if (r > q0)
+    {
+        --q1;
+        r += d;
+    }
+    if (r >= d)
+    {
+        ++q1;
+        r -= d;
+    }
+    rem = r;
+    return q1;
+}
+
+/// (u2 : u1 : u0) / d for (u2 : u1) < d and v = reciprocal_3by2(d): returns the quotient,
+/// rem = the 2-word remainder.
+constexpr u32 udivrem_3by2(u32 u2, u32 u1, u32 u0, u64 d, u32 v, u64& rem) noexcept
+{
+    const auto d1 = static_cast<u32>(d >> 32);
+    const auto d0 = static_cast<u32>(d);
+    const u64 q = u64{v} * u2 + (u64{u2} << 32 | u1);
+    auto q1 = static_cast<u32>(q >> 32);
+    const auto q0 = static_cast<u32>(q);
+    const u32 r1 = u1 - q1 * d1;
+    const u64 t = u64{d0} * q1;
+    u64 r = (u64{r1} << 32 | u0) - t - d;
+    ++q1;
+    if (static_cast<u32>(r >> 32) >= q0)
+    {
+        --q1;
+        r += d;
+    }
+    if (r >= d)
+    {
+        ++q1;
+        r -= d;
+    }
+    rem = r;
+    return q1;
+}
+
+/// x[0..n) -= y[0..n) * mult, returns the borrow out of the top word.
+constexpr u32 submul(u32* x, const u32* y, size_t n, u32 mult) noexcept
+{
+    u32 borrow = 0;
+    for (size_t i = 0; i < n; ++i)
+    {
+        const auto s = x[i] - borrow;
+        const auto p = u64{y[i]} * mult;
+        borrow = static_cast<u32>(p >> 32) + (x[i] < s);
+        x[i] = s - static_cast<u32>(p);
+        borrow += (s < x[i]);
+    }
+    return borrow;
+}
+
+/// x[0..n) += y[0..n), returns the carry out.
+constexpr u32 add(u32* x, const u32* y, size_t n) noexcept
+{
+    u32 carry = 0;
+    for (size_t i = 0; i < n; ++i)
+    {
+        const auto s = x[i] + y[i];
+        const auto c1 = static_cast<u32>(s < x[i]);
+        x[i] = s + carry;
+        carry = c1 | static_cast<u32>(x[i] < s);
+    }
+    return carry;
+}
+
+/// Knuth's D over the normalized u[0..ulen) by d[0..dlen), dlen >= 3: q[0..ulen-dlen) gets the
+/// quotient digits, u[0..dlen) the normalized remainder.
+constexpr void udivrem_knuth(u32* q, u32* u, size_t ulen, const u32* d, size_t dlen) noexcept
+{
+    const auto d1 = d[dlen - 1];
+    const auto d0 = d[dlen - 2];
+    const u64 divisor = u64{d1} << 32 | d0;
+    const auto reciprocal = reciprocal_3by2(d1, d0);
+    for (size_t j = ulen - dlen - 1;; --j)
+    {
+        const auto u2 = u[j + dlen];
+        const auto u1 = u[j + dlen - 1];
+        const auto u0 = u[j + dlen - 2];
+
+        u32 qhat;
+        if ((u64{u2} << 32 | u1) == divisor) [[unlikely]]  // Division overflows.
+        {
+            qhat = ~u32{0};
+            u[j + dlen] = u2 - submul(&u[j], d, dlen, qhat);
+        }
+        else
+        {
+            u64 rhat;
+            qhat = udivrem_3by2(u2, u1, u0, divisor, reciprocal, rhat);
+
+            const auto overflow = submul(&u[j], d, dlen - 2, qhat);
+            const auto rl = static_cast<u32>(rhat);
+            const auto rh = static_cast<u32>(rhat >> 32);
+            u[j + dlen - 2] = rl - overflow;
+            const auto b1 = static_cast<u32>(rl < overflow);
+            u[j + dlen - 1] = rh - b1;
+            if (rh < b1) [[unlikely]]
+            {
+                --qhat;
+                u[j + dlen - 1] += d1 + add(&u[j], d, dlen - 1);
+            }
+        }
+
+        q[j] = qhat;
+        if (j == 0)
+            break;
+    }
+}
+
+template <unsigned M, unsigned N>
+constexpr div_result<uint<M>, uint<N>> udivrem(const uint<M>& x, const uint<N>& y) noexcept
+{
+    constexpr size_t UW = M / 32;
+    constexpr size_t VW = N / 32;
+    u32 uw[UW];
+    u32 vw[VW];
+    std::memcpy(uw, &x, sizeof(uw));
+    std::memcpy(vw, &y, sizeof(vw));
+
+    size_t n = VW;
+    while (n > 0 && vw[n - 1] == 0)
+        --n;
+    INTX_REQUIRE(n != 0);  // Division by 0.
+    size_t m = UW;
+    while (m > 0 && uw[m - 1] == 0)
+        --m;
+    if (m < n)
+        return {0, static_cast<uint<N>>(x)};
+
+    // Normalize: shift both left until the divisor's top word has its top bit set.
+    const auto shift = static_cast<unsigned>(std::countl_zero(vw[n - 1]));
+    u32 un[UW + 1]{};
+    u32 dn[VW];
+    if (shift != 0)
+    {
+        for (size_t i = n - 1; i != 0; --i)
+            dn[i] = (vw[i] << shift) | (vw[i - 1] >> (32 - shift));
+        dn[0] = vw[0] << shift;
+        un[m] = uw[m - 1] >> (32 - shift);
+        for (size_t i = m - 1; i != 0; --i)
+            un[i] = (uw[i] << shift) | (uw[i - 1] >> (32 - shift));
+        un[0] = uw[0] << shift;
+    }
+    else
+    {
+        for (size_t i = 0; i < n; ++i)
+            dn[i] = vw[i];
+        for (size_t i = 0; i < m; ++i)
+            un[i] = uw[i];
+    }
+    // Count the normalized numerator's top word if significant.
+    const size_t ulen = (un[m] != 0 || un[m - 1] >= dn[n - 1]) ? m + 1 : m;
+    if (ulen <= n)
+        return {0, static_cast<uint<N>>(x)};
+
+    u32 qw[UW]{};
+    u32 rw[VW]{};
+    if (n == 1)
+    {
+        const auto d = dn[0];
+        const auto v = reciprocal_2by1(d);
+        u32 rem = un[ulen - 1];
+        for (size_t i = ulen - 1; i-- != 0;)
+            qw[i] = udivrem_2by1(rem, un[i], d, v, rem);
+        rw[0] = rem >> shift;
+    }
+    else if (n == 2)
+    {
+        const u64 d = u64{dn[1]} << 32 | dn[0];
+        const auto v = reciprocal_3by2(dn[1], dn[0]);
+        u64 rem = u64{un[ulen - 1]} << 32 | un[ulen - 2];
+        for (size_t i = ulen - 2; i-- != 0;)
+            qw[i] = udivrem_3by2(static_cast<u32>(rem >> 32), static_cast<u32>(rem), un[i], d, v, rem);
+        rem >>= shift;
+        rw[0] = static_cast<u32>(rem);
+        rw[1] = static_cast<u32>(rem >> 32);
+    }
+    else
+    {
+        udivrem_knuth(qw, un, ulen, dn, n);
+        if (shift != 0)
+        {
+            for (size_t i = 0; i < n - 1; ++i)
+                rw[i] = (un[i] >> shift) | (un[i + 1] << (32 - shift));
+            rw[n - 1] = un[n - 1] >> shift;
+        }
+        else
+        {
+            for (size_t i = 0; i < n; ++i)
+                rw[i] = un[i];
+        }
+    }
+
+    div_result<uint<M>, uint<N>> res;
+    std::memcpy(&res.quot, qw, sizeof(qw));
+    std::memcpy(&res.rem, rw, sizeof(rw));
+    return res;
+}
+}  // namespace div32
+#endif
+
 }  // namespace internal
 
 template <unsigned M, unsigned N>
 constexpr div_result<uint<M>, uint<N>> udivrem(const uint<M>& u, const uint<N>& v) noexcept
 {
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    if (!std::is_constant_evaluated())
+        return internal::div32::udivrem(u, v);
+#endif
     auto na = internal::normalize(u, v);
 
     // The span of the normalized numerator significant words. Will be modified.
