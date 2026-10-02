@@ -2252,6 +2252,41 @@ inline void store(uint8_t* dst, const T& x) noexcept
 }  // namespace le
 
 
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+namespace internal
+{
+/// Writes the 32 bytes at s in reverse byte order to d: d[k] = bswap32(s[7 - k]) word-wise.
+/// Both must be 4-byte aligned; d == s is allowed (all words are loaded first).
+///
+/// This is the whole 256-bit big-endian conversion in 8 loads, 8 stores and the shared-mask
+/// swaps, instead of copying into an aligned temporary and swapping that (8 more loads and
+/// stores), or swapping 64-bit words as pairs of 32-bit halves.
+[[gnu::always_inline]] inline void bswap256_words(void* d, const void* s) noexcept
+{
+    const auto* sw = static_cast<const uint32_t*>(s);
+    auto* dw = static_cast<uint32_t*>(d);
+    uint32_t w[8];
+#pragma GCC unroll 8
+    for (int i = 0; i < 8; ++i)
+        w[i] = sw[i];
+    const uint32_t m1 = 0xFF00FF00u;
+    const uint32_t m2 = 0x00FF00FFu;
+#pragma GCC unroll 8
+    for (int k = 0; k < 8; ++k)
+    {
+        const auto v = w[7 - k];
+        const auto a = ((v << 8) & m1) | ((v >> 8) & m2);
+        dw[k] = (a << 16) | (a >> 16);
+    }
+}
+
+[[gnu::always_inline]] inline bool is_aligned4(const void* p) noexcept
+{
+    return (reinterpret_cast<uintptr_t>(p) & 3) == 0;
+}
+}  // namespace internal
+#endif
+
 namespace be  // Conversions to/from BE bytes.
 {
 /// Loads an integer value from bytes of big-endian order.
@@ -2264,21 +2299,16 @@ inline T load(const uint8_t (&src)[M]) noexcept
 #if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
     if constexpr (M == sizeof(T) && sizeof(T) == 32)
     {
-        // Full-size load: inline word copy avoids memcpy function call overhead.
-        alignas(32) char raw_[sizeof(T)];
-        auto* d = reinterpret_cast<uint32_t*>(raw_);
-        if ((reinterpret_cast<uintptr_t>(src) & 3) == 0)  // 4-byte aligned
-        {
-            const auto* s = reinterpret_cast<const uint32_t*>(src);
-            d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; d[3] = s[3];
-            d[4] = s[4]; d[5] = s[5]; d[6] = s[6]; d[7] = s[7];
-        }
+        // Full-size load: byte-reverse straight from the source words into the result.
+        T x{typename T::uninit_tag{}};
+        if (internal::is_aligned4(src))
+            internal::bswap256_words(&x, src);
         else
         {
+            alignas(32) char raw_[sizeof(T)];
             std::memcpy(raw_, src, M);
+            internal::bswap256_words(&x, raw_);
         }
-        auto& x = *reinterpret_cast<T*>(raw_);
-        x = to_big_endian(x);
         return x;
     }
     else
@@ -2319,12 +2349,14 @@ inline void store(uint8_t (&dst)[sizeof(T)], const T& x) noexcept
 #if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
     if constexpr (sizeof(T) == 32)
     {
-        // Inline bswap + word-store to avoid memcpy function call overhead.
-        const auto d = to_big_endian(x);
-        const auto* s = reinterpret_cast<const uint32_t*>(&d);
-        auto* dd = reinterpret_cast<uint32_t*>(dst);
-        dd[0] = s[0]; dd[1] = s[1]; dd[2] = s[2]; dd[3] = s[3];
-        dd[4] = s[4]; dd[5] = s[5]; dd[6] = s[6]; dd[7] = s[7];
+        // Byte-reverse straight from the value's words into the destination.
+        if (internal::is_aligned4(dst))
+            internal::bswap256_words(dst, &x);
+        else
+        {
+            const auto d = to_big_endian(x);
+            std::memcpy(dst, &d, sizeof(d));
+        }
     }
     else
 #endif
@@ -2418,9 +2450,16 @@ inline IntT load(const uint8_t* src) noexcept
 #if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
     if constexpr (sizeof(IntT) == 32)
     {
-        alignas(32) std::byte aligned_storage[32];
-        copy32(&aligned_storage, src);
-        return to_big_endian(*reinterpret_cast<const IntT*>(&aligned_storage));
+        IntT x{typename IntT::uninit_tag{}};
+        if (internal::is_aligned4(src))
+            internal::bswap256_words(&x, src);
+        else
+        {
+            alignas(32) std::byte aligned_storage[32];
+            std::memcpy(&aligned_storage, src, 32);
+            internal::bswap256_words(&x, &aligned_storage);
+        }
+        return x;
     }
     else if constexpr (sizeof(IntT) == 8)
     {
@@ -2518,20 +2557,16 @@ inline void store(uint8_t* dst, const uint256& x) noexcept
     // On rv32im with -fno-builtin, std::memcpy is a function call. Inline the
     // bswap + store to avoid 4 function calls for 8-byte memcpy chunks.
     // bswap each uint64 word → 2 x bswap32 + swap halves, then store as uint32 words.
-    const auto v0 = to_big_endian(x[0]);
-    const auto v1 = to_big_endian(x[1]);
-    const auto v2 = to_big_endian(x[2]);
-    const auto v3 = to_big_endian(x[3]);
-    if ((reinterpret_cast<uintptr_t>(dst) & 3) == 0)  // 4-byte aligned
+    if (internal::is_aligned4(dst))
     {
-        auto* d = reinterpret_cast<uint32_t*>(dst);
-        d[0] = static_cast<uint32_t>(v3);       d[1] = static_cast<uint32_t>(v3 >> 32);
-        d[2] = static_cast<uint32_t>(v2);       d[3] = static_cast<uint32_t>(v2 >> 32);
-        d[4] = static_cast<uint32_t>(v1);       d[5] = static_cast<uint32_t>(v1 >> 32);
-        d[6] = static_cast<uint32_t>(v0);       d[7] = static_cast<uint32_t>(v0 >> 32);
+        internal::bswap256_words(dst, &x);
     }
     else
     {
+        const auto v0 = to_big_endian(x[0]);
+        const auto v1 = to_big_endian(x[1]);
+        const auto v2 = to_big_endian(x[2]);
+        const auto v3 = to_big_endian(x[3]);
         std::memcpy(dst, &v3, sizeof(v3));
         std::memcpy(dst + 8, &v2, sizeof(v2));
         std::memcpy(dst + 16, &v1, sizeof(v1));
