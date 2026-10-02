@@ -2284,6 +2284,33 @@ namespace internal
 {
     return (reinterpret_cast<uintptr_t>(p) & 3) == 0;
 }
+
+/// Writes the 32 bytes at s in reverse byte order to d with byte loads and stores.
+/// d and s must not overlap; neither needs any alignment.
+///
+/// Without rev8, a word swap costs 8 ALU instructions, so lw + swap + sw is 10 instructions
+/// per 4 bytes (plus the masks) where lbu + sb is 8, and memory need not be word-aligned.
+/// Use it when the destination is memory anyway; a value built in registers is better served
+/// by bswap256_words. One asm block keeps it to one scratch register: as separate C byte
+/// copies GCC hoists the loads and spills hot registers around them.
+[[gnu::always_inline]] inline void bswap256_bytes(void* d, const void* s) noexcept
+{
+    using Bytes = uint8_t[32];
+    uint32_t t;
+#define INTX_RB(si, di) "lbu %[t], " #si "(%[s])\n\tsb %[t], " #di "(%[d])\n\t"
+    asm(
+        INTX_RB(31, 0) INTX_RB(30, 1) INTX_RB(29, 2) INTX_RB(28, 3)
+        INTX_RB(27, 4) INTX_RB(26, 5) INTX_RB(25, 6) INTX_RB(24, 7)
+        INTX_RB(23, 8) INTX_RB(22, 9) INTX_RB(21, 10) INTX_RB(20, 11)
+        INTX_RB(19, 12) INTX_RB(18, 13) INTX_RB(17, 14) INTX_RB(16, 15)
+        INTX_RB(15, 16) INTX_RB(14, 17) INTX_RB(13, 18) INTX_RB(12, 19)
+        INTX_RB(11, 20) INTX_RB(10, 21) INTX_RB(9, 22) INTX_RB(8, 23)
+        INTX_RB(7, 24) INTX_RB(6, 25) INTX_RB(5, 26) INTX_RB(4, 27)
+        INTX_RB(3, 28) INTX_RB(2, 29) INTX_RB(1, 30) INTX_RB(0, 31)
+        : [t] "=&r"(t), "=m"(*static_cast<Bytes*>(d))
+        : [d] "r"(d), [s] "r"(s), "m"(*static_cast<const Bytes*>(s)));
+#undef INTX_RB
+}
 }  // namespace internal
 #endif
 
@@ -2348,16 +2375,7 @@ inline void store(uint8_t (&dst)[sizeof(T)], const T& x) noexcept
 {
 #if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
     if constexpr (sizeof(T) == 32)
-    {
-        // Byte-reverse straight from the value's words into the destination.
-        if (internal::is_aligned4(dst))
-            internal::bswap256_words(dst, &x);
-        else
-        {
-            const auto d = to_big_endian(x);
-            std::memcpy(dst, &d, sizeof(d));
-        }
-    }
+        internal::bswap256_bytes(dst, &x);
     else
 #endif
     {
@@ -2504,6 +2522,16 @@ inline IntT load(const uint8_t* src) noexcept
     }
 }
 
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+/// Loads 32 big-endian bytes from src into the existing value x, which must not overlap src.
+/// Reversing the bytes straight into x beats building the value in registers when x lives in
+/// memory anyway (an EVM stack slot), see internal::bswap256_bytes.
+inline void load_into(uint256& x, const uint8_t* src) noexcept
+{
+    internal::bswap256_bytes(&x, src);
+}
+#endif
+
 /// Stores an integer value at the provided pointer in big-endian order. The user must make sure
 /// that the provided buffer is big enough to fit the value. Therefore, marked "unsafe".
 template <typename T>
@@ -2554,24 +2582,8 @@ inline void store(uint8_t* dst, const T& x) noexcept
 inline void store(uint8_t* dst, const uint256& x) noexcept
 {
 #if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
-    // On rv32im with -fno-builtin, std::memcpy is a function call. Inline the
-    // bswap + store to avoid 4 function calls for 8-byte memcpy chunks.
-    // bswap each uint64 word → 2 x bswap32 + swap halves, then store as uint32 words.
-    if (internal::is_aligned4(dst))
-    {
-        internal::bswap256_words(dst, &x);
-    }
-    else
-    {
-        const auto v0 = to_big_endian(x[0]);
-        const auto v1 = to_big_endian(x[1]);
-        const auto v2 = to_big_endian(x[2]);
-        const auto v3 = to_big_endian(x[3]);
-        std::memcpy(dst, &v3, sizeof(v3));
-        std::memcpy(dst + 8, &v2, sizeof(v2));
-        std::memcpy(dst + 16, &v1, sizeof(v1));
-        std::memcpy(dst + 24, &v0, sizeof(v0));
-    }
+    // The destination is memory, so reverse the bytes straight into it (any alignment).
+    internal::bswap256_bytes(dst, &x);
 #else
     // Store byte-swapped words in primitive temporaries. This helps with memory aliasing
     // and GCC bug https://gcc.gnu.org/bugzilla/show_bug.cgi?id=107837
