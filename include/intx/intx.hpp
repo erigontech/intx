@@ -2027,8 +2027,17 @@ using u64 = uint64_t;
 /// A 32-bit word of a uint<N> (stored as 64-bit words): may alias them.
 typedef uint32_t __attribute__((may_alias)) w32;
 
-/// Leading zeros of a non-zero word in 5 compare-and-shift steps: libgcc's __clzsi2 is a call,
-/// around which the caller spills its live registers.
+/// Leading zeros of each non-zero byte value.
+inline constexpr auto clz_byte_table = []() noexcept {
+    std::array<uint8_t, 256> table{};
+    for (size_t i = 1; i < table.size(); ++i)
+        table[i] = static_cast<uint8_t>(std::countl_zero(static_cast<uint8_t>(i)));
+    return table;
+}();
+
+/// Leading zeros of a non-zero word (0 would give 24): 2 compare-and-shift steps bring its top
+/// set bit into the top byte, and the table counts the rest in place of 3 more steps. libgcc's
+/// __clzsi2 is a call, around which the caller spills its live registers.
 constexpr unsigned clz_nonzero(u32 x) noexcept
 {
     unsigned n = 0;
@@ -2042,19 +2051,7 @@ constexpr unsigned clz_nonzero(u32 x) noexcept
         n += 8;
         x <<= 8;
     }
-    if (x < 0x10000000)
-    {
-        n += 4;
-        x <<= 4;
-    }
-    if (x < 0x40000000)
-    {
-        n += 2;
-        x <<= 2;
-    }
-    if (x < 0x80000000)
-        n += 1;
-    return n;
+    return n + clz_byte_table[x >> 24];
 }
 
 /// floor((B^2 - 1) / d) - B for normalized d: the 64/32 division (~d : B-1) / d, whose quotient
@@ -2195,7 +2192,8 @@ constexpr u32 add(u32* x, const u32* y, size_t n) noexcept
 
 /// Knuth's D over the normalized u[0..ulen) by d[0..dlen), dlen >= 3: q[0..ulen-dlen) gets the
 /// quotient digits, u[0..dlen) the normalized remainder.
-constexpr void udivrem_knuth(w32* q, u32* u, size_t ulen, const u32* d, size_t dlen) noexcept
+[[gnu::always_inline]] constexpr void udivrem_knuth(
+    w32* q, u32* u, size_t ulen, const u32* d, size_t dlen) noexcept
 {
     const auto d1 = d[dlen - 1];
     const auto d0 = d[dlen - 2];
@@ -2237,6 +2235,40 @@ constexpr void udivrem_knuth(w32* q, u32* u, size_t ulen, const u32* d, size_t d
     }
 }
 
+/// udivrem_knuth() for a divisor length known at compile time: its inner loops unroll without
+/// per-word exit tests, and the divisor, copied out of d, stays in registers.
+template <size_t DLEN>
+[[gnu::always_inline]] constexpr void udivrem_knuth_fixed(
+    w32* q, u32* u, size_t ulen, const u32* d) noexcept
+{
+    u32 dr[DLEN];
+    for (size_t i = 0; i < DLEN; ++i)
+        dr[i] = d[i];
+    udivrem_knuth(q, u, ulen, dr, DLEN);
+}
+
+/// r[0..n) = u[0..n) >> shift: the remainder out of the normalized one.
+[[gnu::always_inline]] constexpr void unnormalize(
+    w32* r, const u32* u, size_t n, unsigned shift) noexcept
+{
+    if (shift != 0)
+    {
+        u32 lo = u[0];
+        for (size_t i = 0; i < n - 1; ++i)
+        {
+            const u32 hi = u[i + 1];
+            r[i] = (lo >> shift) | (hi << (32 - shift));
+            lo = hi;
+        }
+        r[n - 1] = lo >> shift;
+    }
+    else
+    {
+        for (size_t i = 0; i < n; ++i)
+            r[i] = u[i];
+    }
+}
+
 template <typename T>
 [[gnu::always_inline]] inline T uninit_uint() noexcept
 {
@@ -2255,6 +2287,11 @@ constexpr div_result<uint<M>, uint<N>> udivrem(const uint<M>& x, const uint<N>& 
     // drop the result stores as dead stores to uint64_t words.
     const w32* const uw = reinterpret_cast<const w32*>(&x);
     const w32* const vw = reinterpret_cast<const w32*>(&y);
+    // The quotient digits and the remainder go straight into the result. Every path returns this
+    // one object, so GCC builds it in the caller's return slot (NRVO) instead of copying it there.
+    div_result<uint<M>, uint<N>> res{uninit_uint<uint<M>>(), uninit_uint<uint<N>>()};
+    w32* const qw = reinterpret_cast<w32*>(&res.quot);
+    w32* const rw = reinterpret_cast<w32*>(&res.rem);
 
     size_t n = VW;
     while (n > 0 && vw[n - 1] == 0)
@@ -2263,45 +2300,77 @@ constexpr div_result<uint<M>, uint<N>> udivrem(const uint<M>& x, const uint<N>& 
     size_t m = UW;
     while (m > 0 && uw[m - 1] == 0)
         --m;
-    if (m < n)
-        return {0, static_cast<uint<N>>(x)};
+    if (m < n)  // x < y: the quotient is 0, the remainder x.
+    {
+        for (size_t i = 0; i < UW; ++i)
+            qw[i] = 0;
+        for (size_t i = 0; i < VW; ++i)
+            rw[i] = i < UW ? uw[i] : 0;
+        return res;
+    }
 
-    // Normalize: shift both left until the divisor's top word has its top bit set.
-    // Only un[0..m] and dn[0..n) are used.
+    // Normalize: shift both left until the divisor's top word has its top bit set. The whole
+    // numerator is shifted, since with constant indices that is cheaper than a loop over its m
+    // significant words. The divisor is shifted over its n significant words, or over all of them
+    // under a wider numerator (MULMOD, whose modulus mostly has all words significant). un[m]
+    // takes the numerator's shifted-out top bits; the words above it come out zero. Only
+    // un[0..m] and dn[0..n) are used.
     const auto shift = clz_nonzero(vw[n - 1]);
+    const size_t dwords = M > N ? VW : n;
     u32 un[UW + 1];
     u32 dn[VW];
     if (shift != 0)
     {
-        for (size_t i = n - 1; i != 0; --i)
-            dn[i] = (vw[i] << shift) | (vw[i - 1] >> (32 - shift));
-        dn[0] = vw[0] << shift;
-        un[m] = uw[m - 1] >> (32 - shift);
-        for (size_t i = m - 1; i != 0; --i)
-            un[i] = (uw[i] << shift) | (uw[i - 1] >> (32 - shift));
-        un[0] = uw[0] << shift;
+        const auto rs = 32 - shift;
+        u32 hi = vw[dwords - 1];
+        for (size_t i = dwords - 1; i != 0; --i)
+        {
+            const u32 lo = vw[i - 1];
+            dn[i] = (hi << shift) | (lo >> rs);
+            hi = lo;
+        }
+        dn[0] = hi << shift;
+        hi = uw[UW - 1];
+        un[UW] = hi >> rs;
+        for (size_t i = UW - 1; i != 0; --i)
+        {
+            const u32 lo = uw[i - 1];
+            un[i] = (hi << shift) | (lo >> rs);
+            hi = lo;
+        }
+        un[0] = hi << shift;
     }
     else
     {
-        for (size_t i = 0; i < n; ++i)
+        for (size_t i = 0; i < dwords; ++i)
             dn[i] = vw[i];
-        for (size_t i = 0; i < m; ++i)
+        for (size_t i = 0; i < UW; ++i)
             un[i] = uw[i];
-        un[m] = 0;
+        un[UW] = 0;
     }
     // Count the normalized numerator's top word if significant.
     const size_t ulen = (un[m] != 0 || un[m - 1] >= dn[n - 1]) ? m + 1 : m;
-    if (ulen <= n)
-        return {0, static_cast<uint<N>>(x)};
+    if (ulen <= n)  // x < y
+    {
+        for (size_t i = 0; i < UW; ++i)
+            qw[i] = 0;
+        for (size_t i = 0; i < VW; ++i)
+            rw[i] = i < UW ? uw[i] : 0;
+        return res;
+    }
 
-    // Write the quotient digits [0, ulen - n) and the remainder straight into the result.
-    div_result<uint<M>, uint<N>> res{uninit_uint<uint<M>>(), uninit_uint<uint<N>>()};
-    w32* const qw = reinterpret_cast<w32*>(&res.quot);
-    w32* const rw = reinterpret_cast<w32*>(&res.rem);
-    for (size_t i = ulen - n; i < UW; ++i)
+    // A full-width divisor under a wider numerator (MULMOD): the loops over its words get fixed
+    // lengths, and the remainder fills all words.
+    const bool full_divisor = M > N && n == VW;
+    // Zero the result, one store per word (the remainder only if it is not filled), then write
+    // the quotient digits [0, ulen - n) and the remainder over it.
+    for (size_t i = 0; i < UW; ++i)
         qw[i] = 0;
-    for (size_t i = n; i < VW; ++i)
-        rw[i] = 0;
+    if (!full_divisor)
+    {
+        for (size_t i = 0; i < VW; ++i)
+            rw[i] = 0;
+    }
     if (n == 1)
     {
         const auto d = dn[0];
@@ -2322,20 +2391,15 @@ constexpr div_result<uint<M>, uint<N>> udivrem(const uint<M>& x, const uint<N>& 
         rw[0] = static_cast<u32>(rem);
         rw[1] = static_cast<u32>(rem >> 32);
     }
+    else if (full_divisor)
+    {
+        udivrem_knuth_fixed<VW>(qw, un, ulen, dn);
+        unnormalize(rw, un, VW, shift);
+    }
     else
     {
         udivrem_knuth(qw, un, ulen, dn, n);
-        if (shift != 0)
-        {
-            for (size_t i = 0; i < n - 1; ++i)
-                rw[i] = (un[i] >> shift) | (un[i + 1] << (32 - shift));
-            rw[n - 1] = un[n - 1] >> shift;
-        }
-        else
-        {
-            for (size_t i = 0; i < n; ++i)
-                rw[i] = un[i];
-        }
+        unnormalize(rw, un, n, shift);
     }
     return res;
 }
