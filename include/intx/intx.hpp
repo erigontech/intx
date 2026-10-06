@@ -3037,6 +3037,21 @@ inline void load_into(uint256& x, const uint8_t* src) noexcept
     else
         internal::bswap256_bytes(&x, src);
 }
+
+/// load_into() for a src that is known to be 4-byte aligned (a local, not memory of the EVM or
+/// the witness): the leading zero words are skipped without the alignment test. src must not
+/// overlap x.
+inline void load_aligned_into(uint256& x, const uint8_t* src) noexcept
+{
+    internal::bswap256_from_aligned(&x, src);
+}
+
+/// store() for a dst that is known to be 4-byte aligned, see load_aligned_into(). dst must not
+/// overlap x.
+inline void store_aligned(uint8_t* dst, const uint256& x) noexcept
+{
+    internal::bswap256_to_aligned(dst, &x);
+}
 #endif
 
 /// Stores an integer value at the provided pointer in big-endian order. The user must make sure
