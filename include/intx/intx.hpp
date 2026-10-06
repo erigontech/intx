@@ -2705,6 +2705,61 @@ namespace internal
         : [d] "r"(d), [s] "r"(s), "m"(*static_cast<const Bytes*>(s)));
 #undef INTX_RB
 }
+
+// The word-wise variants of bswap256_bytes for a 4-byte aligned big-endian side. They test the
+// words from the most significant one down and store each leading zero word as one zero word;
+// the first non-zero word and all after it are reversed with 3 shifts and 4 byte stores. That is
+// 3 instructions per leading zero word and 8 per other word, 25 + 5 k for k significant words
+// instead of 64: EVM memory words are mostly small numbers (k = 1) or addresses (k = 5).
+// INTX_LZ: word n from source offset so, a zero word at destination offset dw;
+// INTX_RW: word n reversed into destination bytes d0..d3; INTX_LW: the next word.
+#define INTX_LZ(n, so, dw) \
+    "lw %[t], " #so "(%[s])\n\tbnez %[t], 7" #n "f\n\tsw zero, " #dw "(%[d])\n\t"
+#define INTX_RW(n, d0, d1, d2, d3)                                            \
+    "7" #n ":\n\t"                                                            \
+    "srli %[u], %[t], 24\n\tsb %[u], " #d0 "(%[d])\n\t"                       \
+    "srli %[u], %[t], 16\n\tsb %[u], " #d1 "(%[d])\n\t"                       \
+    "srli %[u], %[t], 8\n\tsb %[u], " #d2 "(%[d])\n\t"                        \
+    "sb %[t], " #d3 "(%[d])\n\t"
+#define INTX_LW(so) "lw %[t], " #so "(%[s])\n\t"
+
+/// bswap256_bytes from 32 big-endian bytes at a 4-byte aligned s. d and s must not overlap.
+[[gnu::always_inline]] inline void bswap256_from_aligned(void* d, const void* s) noexcept
+{
+    using Bytes = uint8_t[32];
+    uint32_t t, u;
+    asm(INTX_LZ(0, 0, 28) INTX_LZ(1, 4, 24) INTX_LZ(2, 8, 20) INTX_LZ(3, 12, 16)
+        INTX_LZ(4, 16, 12) INTX_LZ(5, 20, 8) INTX_LZ(6, 24, 4) INTX_LZ(7, 28, 0)
+        "j 79f\n\t"
+        INTX_RW(0, 28, 29, 30, 31) INTX_LW(4) INTX_RW(1, 24, 25, 26, 27)
+        INTX_LW(8) INTX_RW(2, 20, 21, 22, 23) INTX_LW(12) INTX_RW(3, 16, 17, 18, 19)
+        INTX_LW(16) INTX_RW(4, 12, 13, 14, 15) INTX_LW(20) INTX_RW(5, 8, 9, 10, 11)
+        INTX_LW(24) INTX_RW(6, 4, 5, 6, 7) INTX_LW(28) INTX_RW(7, 0, 1, 2, 3)
+        "79:"
+        : [t] "=&r"(t), [u] "=&r"(u), "=m"(*static_cast<Bytes*>(d))
+        : [d] "r"(d), [s] "r"(s), "m"(*static_cast<const Bytes*>(s)));
+}
+
+/// bswap256_bytes to 32 big-endian bytes at a 4-byte aligned d. s is a value (its words aligned);
+/// d and s must not overlap.
+[[gnu::always_inline]] inline void bswap256_to_aligned(void* d, const void* s) noexcept
+{
+    using Bytes = uint8_t[32];
+    uint32_t t, u;
+    asm(INTX_LZ(0, 28, 0) INTX_LZ(1, 24, 4) INTX_LZ(2, 20, 8) INTX_LZ(3, 16, 12)
+        INTX_LZ(4, 12, 16) INTX_LZ(5, 8, 20) INTX_LZ(6, 4, 24) INTX_LZ(7, 0, 28)
+        "j 79f\n\t"
+        INTX_RW(0, 0, 1, 2, 3) INTX_LW(24) INTX_RW(1, 4, 5, 6, 7)
+        INTX_LW(20) INTX_RW(2, 8, 9, 10, 11) INTX_LW(16) INTX_RW(3, 12, 13, 14, 15)
+        INTX_LW(12) INTX_RW(4, 16, 17, 18, 19) INTX_LW(8) INTX_RW(5, 20, 21, 22, 23)
+        INTX_LW(4) INTX_RW(6, 24, 25, 26, 27) INTX_LW(0) INTX_RW(7, 28, 29, 30, 31)
+        "79:"
+        : [t] "=&r"(t), [u] "=&r"(u), "=m"(*static_cast<Bytes*>(d))
+        : [d] "r"(d), [s] "r"(s), "m"(*static_cast<const Bytes*>(s)));
+}
+#undef INTX_LZ
+#undef INTX_RW
+#undef INTX_LW
 }  // namespace internal
 #endif
 
@@ -2919,10 +2974,14 @@ inline IntT load(const uint8_t* src) noexcept
 #if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
 /// Loads 32 big-endian bytes from src into the existing value x, which must not overlap src.
 /// Reversing the bytes straight into x beats building the value in registers when x lives in
-/// memory anyway (an EVM stack slot), see internal::bswap256_bytes.
+/// memory anyway (an EVM stack slot), see internal::bswap256_bytes. A word-aligned src (most
+/// MLOAD offsets and calldata arguments) skips the leading zero words.
 inline void load_into(uint256& x, const uint8_t* src) noexcept
 {
-    internal::bswap256_bytes(&x, src);
+    if (internal::is_aligned4(src)) [[likely]]
+        internal::bswap256_from_aligned(&x, src);
+    else
+        internal::bswap256_bytes(&x, src);
 }
 #endif
 
@@ -2976,8 +3035,12 @@ inline void store(uint8_t* dst, const T& x) noexcept
 inline void store(uint8_t* dst, const uint256& x) noexcept
 {
 #if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
-    // The destination is memory, so reverse the bytes straight into it (any alignment).
-    internal::bswap256_bytes(dst, &x);
+    // The destination is memory, so reverse the bytes straight into it (any alignment). A
+    // word-aligned one (most MSTORE offsets) skips the leading zero words.
+    if (internal::is_aligned4(dst)) [[likely]]
+        internal::bswap256_to_aligned(dst, &x);
+    else
+        internal::bswap256_bytes(dst, &x);
 #else
     // Store byte-swapped words in primitive temporaries. This helps with memory aliasing
     // and GCC bug https://gcc.gnu.org/bugzilla/show_bug.cgi?id=107837
