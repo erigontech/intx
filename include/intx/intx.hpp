@@ -2191,7 +2191,8 @@ constexpr u32 add(u32* x, const u32* y, size_t n) noexcept
 }
 
 /// Knuth's D over the normalized u[0..ulen) by d[0..dlen), dlen >= 3: q[0..ulen-dlen) gets the
-/// quotient digits, u[0..dlen) the normalized remainder.
+/// quotient digits (not without WithQuot), u[0..dlen) the normalized remainder.
+template <bool WithQuot>
 [[gnu::always_inline]] constexpr void udivrem_knuth(
     w32* q, u32* u, size_t ulen, const u32* d, size_t dlen) noexcept
 {
@@ -2229,7 +2230,8 @@ constexpr u32 add(u32* x, const u32* y, size_t n) noexcept
             }
         }
 
-        q[j] = qhat;
+        if constexpr (WithQuot)
+            q[j] = qhat;
         if (j == 0)
             break;
     }
@@ -2237,14 +2239,14 @@ constexpr u32 add(u32* x, const u32* y, size_t n) noexcept
 
 /// udivrem_knuth() for a divisor length known at compile time: its inner loops unroll without
 /// per-word exit tests, and the divisor, copied out of d, stays in registers.
-template <size_t DLEN>
+template <size_t DLEN, bool WithQuot>
 [[gnu::always_inline]] constexpr void udivrem_knuth_fixed(
     w32* q, u32* u, size_t ulen, const u32* d) noexcept
 {
     u32 dr[DLEN];
     for (size_t i = 0; i < DLEN; ++i)
         dr[i] = d[i];
-    udivrem_knuth(q, u, ulen, dr, DLEN);
+    udivrem_knuth<WithQuot>(q, u, ulen, dr, DLEN);
 }
 
 /// r[0..n) = u[0..n) >> shift: the remainder out of the normalized one.
@@ -2278,35 +2280,28 @@ template <typename T>
         return T{};
 }
 
-template <unsigned M, unsigned N>
-constexpr div_result<uint<M>, uint<N>> udivrem(const uint<M>& x, const uint<N>& y) noexcept
+/// x / y into qw[0..M/32) with WithQuot and x % y into rw[0..N/32) with WithRem, for y of n
+/// significant words (n != 0). Either result may be y itself: y is read in full (the normalized
+/// divisor is built from it) before the first store to qw or rw, and x is never a result.
+template <unsigned M, unsigned N, bool WithQuot, bool WithRem>
+[[gnu::always_inline]] inline void divide(
+    const w32* uw, const w32* vw, w32* qw, w32* rw, size_t n) noexcept
 {
     constexpr size_t UW = M / 32;
     constexpr size_t VW = N / 32;
-    // Spelled out: `auto` would deduce plain uint32_t, dropping may_alias, and then GCC is free to
-    // drop the result stores as dead stores to uint64_t words.
-    const w32* const uw = reinterpret_cast<const w32*>(&x);
-    const w32* const vw = reinterpret_cast<const w32*>(&y);
-    // The quotient digits and the remainder go straight into the result. Every path returns this
-    // one object, so GCC builds it in the caller's return slot (NRVO) instead of copying it there.
-    div_result<uint<M>, uint<N>> res{uninit_uint<uint<M>>(), uninit_uint<uint<N>>()};
-    w32* const qw = reinterpret_cast<w32*>(&res.quot);
-    w32* const rw = reinterpret_cast<w32*>(&res.rem);
-
-    size_t n = VW;
-    while (n > 0 && vw[n - 1] == 0)
-        --n;
     INTX_REQUIRE(n != 0);  // Division by 0.
     size_t m = UW;
     while (m > 0 && uw[m - 1] == 0)
         --m;
     if (m < n)  // x < y: the quotient is 0, the remainder x.
     {
-        for (size_t i = 0; i < UW; ++i)
-            qw[i] = 0;
-        for (size_t i = 0; i < VW; ++i)
-            rw[i] = i < UW ? uw[i] : 0;
-        return res;
+        if constexpr (WithQuot)
+            for (size_t i = 0; i < UW; ++i)
+                qw[i] = 0;
+        if constexpr (WithRem)
+            for (size_t i = 0; i < VW; ++i)
+                rw[i] = i < UW ? uw[i] : 0;
+        return;
     }
 
     // Normalize: shift both left until the divisor's top word has its top bit set. The whole
@@ -2352,24 +2347,30 @@ constexpr div_result<uint<M>, uint<N>> udivrem(const uint<M>& x, const uint<N>& 
     const size_t ulen = (un[m] != 0 || un[m - 1] >= dn[n - 1]) ? m + 1 : m;
     if (ulen <= n)  // x < y
     {
-        for (size_t i = 0; i < UW; ++i)
-            qw[i] = 0;
-        for (size_t i = 0; i < VW; ++i)
-            rw[i] = i < UW ? uw[i] : 0;
-        return res;
+        if constexpr (WithQuot)
+            for (size_t i = 0; i < UW; ++i)
+                qw[i] = 0;
+        if constexpr (WithRem)
+            for (size_t i = 0; i < VW; ++i)
+                rw[i] = i < UW ? uw[i] : 0;
+        return;
     }
 
     // A full-width divisor under a wider numerator (MULMOD): the loops over its words get fixed
     // lengths, and the remainder fills all words.
     const bool full_divisor = M > N && n == VW;
-    // Zero the result, one store per word (the remainder only if it is not filled), then write
+    // Zero the quotient, one store per word (the remainder only if it is not filled), then write
     // the quotient digits [0, ulen - n) and the remainder over it.
-    for (size_t i = 0; i < UW; ++i)
-        qw[i] = 0;
-    if (!full_divisor)
+    if constexpr (WithQuot)
+        for (size_t i = 0; i < UW; ++i)
+            qw[i] = 0;
+    if constexpr (WithRem)
     {
-        for (size_t i = 0; i < VW; ++i)
-            rw[i] = 0;
+        if (!full_divisor)
+        {
+            for (size_t i = 0; i < VW; ++i)
+                rw[i] = 0;
+        }
     }
     if (n == 1)
     {
@@ -2377,8 +2378,13 @@ constexpr div_result<uint<M>, uint<N>> udivrem(const uint<M>& x, const uint<N>& 
         const auto v = reciprocal_2by1(d);
         u32 rem = un[ulen - 1];
         for (size_t i = ulen - 1; i-- != 0;)
-            qw[i] = udivrem_2by1(rem, un[i], d, v, rem);
-        rw[0] = rem >> shift;
+        {
+            const auto qhat = udivrem_2by1(rem, un[i], d, v, rem);
+            if constexpr (WithQuot)
+                qw[i] = qhat;
+        }
+        if constexpr (WithRem)
+            rw[0] = rem >> shift;
     }
     else if (n == 2)
     {
@@ -2386,22 +2392,70 @@ constexpr div_result<uint<M>, uint<N>> udivrem(const uint<M>& x, const uint<N>& 
         const auto v = reciprocal_3by2(dn[1], dn[0]);
         u64 rem = u64{un[ulen - 1]} << 32 | un[ulen - 2];
         for (size_t i = ulen - 2; i-- != 0;)
-            qw[i] = udivrem_3by2(static_cast<u32>(rem >> 32), static_cast<u32>(rem), un[i], d, v, rem);
-        rem >>= shift;
-        rw[0] = static_cast<u32>(rem);
-        rw[1] = static_cast<u32>(rem >> 32);
+        {
+            const auto qhat =
+                udivrem_3by2(static_cast<u32>(rem >> 32), static_cast<u32>(rem), un[i], d, v, rem);
+            if constexpr (WithQuot)
+                qw[i] = qhat;
+        }
+        if constexpr (WithRem)
+        {
+            rem >>= shift;
+            rw[0] = static_cast<u32>(rem);
+            rw[1] = static_cast<u32>(rem >> 32);
+        }
     }
     else if (full_divisor)
     {
-        udivrem_knuth_fixed<VW>(qw, un, ulen, dn);
-        unnormalize(rw, un, VW, shift);
+        udivrem_knuth_fixed<VW, WithQuot>(qw, un, ulen, dn);
+        if constexpr (WithRem)
+            unnormalize(rw, un, VW, shift);
     }
     else
     {
-        udivrem_knuth(qw, un, ulen, dn, n);
-        unnormalize(rw, un, n, shift);
+        udivrem_knuth<WithQuot>(qw, un, ulen, dn, n);
+        if constexpr (WithRem)
+            unnormalize(rw, un, n, shift);
     }
+}
+
+template <unsigned M, unsigned N>
+constexpr div_result<uint<M>, uint<N>> udivrem(const uint<M>& x, const uint<N>& y) noexcept
+{
+    // Spelled out: `auto` would deduce plain uint32_t, dropping may_alias, and then GCC is free to
+    // drop the result stores as dead stores to uint64_t words.
+    const w32* const vw = reinterpret_cast<const w32*>(&y);
+    // The quotient digits and the remainder go straight into the result. Every path returns this
+    // one object, so GCC builds it in the caller's return slot (NRVO) instead of copying it there.
+    div_result<uint<M>, uint<N>> res{uninit_uint<uint<M>>(), uninit_uint<uint<N>>()};
+    size_t n = N / 32;
+    while (n > 0 && vw[n - 1] == 0)
+        --n;
+    divide<M, N, true, true>(reinterpret_cast<const w32*>(&x), vw, reinterpret_cast<w32*>(&res.quot),
+        reinterpret_cast<w32*>(&res.rem), n);
     return res;
+}
+
+/// r = x % y, where r may be y itself. The remainder alone, in place: no quotient digits, no
+/// result copy.
+template <unsigned M, unsigned N>
+[[gnu::noinline]] void urem(const uint<M>& x, const uint<N>& y, uint<N>& r) noexcept
+{
+    const w32* const vw = reinterpret_cast<const w32*>(&y);
+    size_t n = N / 32;
+    while (n > 0 && vw[n - 1] == 0)
+        --n;
+    divide<M, N, false, true>(
+        reinterpret_cast<const w32*>(&x), vw, nullptr, reinterpret_cast<w32*>(&r), n);
+}
+
+/// q = x / y, where q may be y itself and y has n significant words (the caller knows: it has
+/// just looked at all of them).
+template <unsigned N>
+[[gnu::noinline]] void udiv(const uint<N>& x, const uint<N>& y, uint<N>& q, size_t n) noexcept
+{
+    divide<N, N, true, false>(reinterpret_cast<const w32*>(&x), reinterpret_cast<const w32*>(&y),
+        reinterpret_cast<w32*>(&q), nullptr, n);
 }
 }  // namespace div32
 #endif
