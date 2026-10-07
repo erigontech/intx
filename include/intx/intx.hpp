@@ -2711,8 +2711,12 @@ namespace internal
 /// stores), or swapping 64-bit words as pairs of 32-bit halves.
 [[gnu::always_inline]] inline void bswap256_words(void* d, const void* s) noexcept
 {
-    const auto* sw = static_cast<const uint32_t*>(s);
-    auto* dw = static_cast<uint32_t*>(d);
+    // Words of a named may_alias type (auto would drop the attribute): d is a uint256, whose
+    // words are uint64_t, and s a byte buffer. Through plain uint32_t the stores to d do not
+    // alias the uint64_t reads of the result, and GCC is free to drop them as dead stores.
+    typedef uint32_t __attribute__((may_alias)) w32;
+    const w32* const sw = static_cast<const w32*>(s);
+    w32* const dw = static_cast<w32*>(d);
     uint32_t w[8];
 #pragma GCC unroll 8
     for (int i = 0; i < 8; ++i)
