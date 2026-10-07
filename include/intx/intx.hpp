@@ -1041,8 +1041,10 @@ public:
         // On rv32im, short-circuit on the low word for the common case.
         // Most EVM non-zero values (booleans, addresses, counters) have non-zero
         // low bits, so this avoids loading and OR-folding all 8 uint32 halves.
-        // Uses uint32_t to avoid 64-bit decomposition overhead.
-        const auto* w = reinterpret_cast<const uint32_t*>(words_);
+        // Uses uint32_t to avoid 64-bit decomposition overhead, through a named may_alias type
+        // (auto would drop the attribute): plain uint32_t loads need not see uint64_t stores.
+        typedef uint32_t __attribute__((may_alias)) w32;
+        const w32* const w = reinterpret_cast<const w32*>(words_);
         if ((w[0] | w[1]) != 0)
             return true;
         // Fall through: check upper words only if low word is zero.
@@ -2953,10 +2955,12 @@ namespace unsafe
 /// Uses 4-byte word loads when src is 4-byte aligned; falls back to byte loads otherwise.
 inline void copy32(void* dst, const uint8_t* src) noexcept
 {
-    auto* d = static_cast<uint32_t*>(dst);
+    // The words of a named may_alias type, as in internal::bswap256_words: dst is mostly a uint256.
+    typedef uint32_t __attribute__((may_alias)) w32;
+    w32* const d = static_cast<w32*>(dst);
     if ((reinterpret_cast<uintptr_t>(src) & 3) == 0)  // 4-byte aligned
     {
-        const auto* s = reinterpret_cast<const uint32_t*>(src);
+        const w32* const s = reinterpret_cast<const w32*>(src);
         d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; d[3] = s[3];
         d[4] = s[4]; d[5] = s[5]; d[6] = s[6]; d[7] = s[7];
     }
