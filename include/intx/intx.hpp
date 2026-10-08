@@ -1787,9 +1787,32 @@ constexpr unsigned count_significant_words(const uint<N>& x) noexcept
     return 0;
 }
 
+namespace internal
+{
+/// count_significant_bytes() of a 64-bit word by comparisons on its significant 32-bit half,
+/// without a leading-zero count. 4 to 7 instructions inline on rv32.
+constexpr unsigned count_significant_bytes_by_compare(uint64_t x) noexcept
+{
+    const auto hi = static_cast<uint32_t>(x >> 32);
+    const auto v = hi != 0 ? hi : static_cast<uint32_t>(x);
+    // This form keeps the comparison results as values; nested constant ternaries become
+    // branches between constant loads.
+    const unsigned n =
+        v >= 0x10000 ? 3 + unsigned{v >= 0x1000000} : unsigned{v >= 0x100} + unsigned{v != 0};
+    return hi != 0 ? 4 + n : n;
+}
+}  // namespace internal
+
 constexpr unsigned count_significant_bytes(uint64_t x) noexcept
 {
+    // rv32im has no leading-zero count: clz() of a 64-bit word is a call to libgcc's __clzdi2,
+    // around which the caller spills its live registers. The RLP encoders and EXP's gas count
+    // call this on every length and value.
+#if defined(__riscv) && __riscv_xlen == 32 && !defined(__riscv_zbb)
+    return internal::count_significant_bytes_by_compare(x);
+#else
     return (64 - clz(x) + 7) / 8;
+#endif
 }
 
 template <unsigned N>
